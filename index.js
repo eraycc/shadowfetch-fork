@@ -2,9 +2,13 @@ import { connect } from "cloudflare:sockets";
 
 // Global configuration including the authentication token, default destination URL, and debug mode flag
 const CONFIG = {
-  AUTH_TOKEN: "image",
+  AUTH_TOKEN: "你的认证路径",
   DEFAULT_DST_URL: "https://example.com/",
   DEBUG_MODE: false,
+  // 新增验证码密码配置，客户端提交正确密码后会在 Cookie 中写入该密码
+  PASSWORD: "认证路径上的密码",
+  // 新增安全路径配置，当请求路径第一个分段为 SafePath 时不需要 Cookie 验证
+  SafePath: "安全路径，此路径无需密码验证",
 };
 
 // Update global configuration from environment variables (prioritizing environment values)
@@ -12,8 +16,8 @@ function updateConfigFromEnv(env) {
   if (!env) return;
   for (const key of Object.keys(CONFIG)) {
     if (key in env) {
-      if (typeof CONFIG[key] === 'boolean') {
-        CONFIG[key] = env[key] === 'true';
+      if (typeof CONFIG[key] === "boolean") {
+        CONFIG[key] = env[key] === "true";
       } else {
         CONFIG[key] = env[key];
       }
@@ -320,19 +324,19 @@ async function nativeFetch(req, dstUrl) {
     const key = generateWebSocketKey();
 
     // Construct the HTTP headers required for the handshake
-    cleanedHeaders.set('Host', targetUrl.hostname);
-    cleanedHeaders.set('Connection', 'Upgrade');
-    cleanedHeaders.set('Upgrade', 'websocket');
-    cleanedHeaders.set('Sec-WebSocket-Version', '13');
-    cleanedHeaders.set('Sec-WebSocket-Key', key);
+    cleanedHeaders.set("Host", targetUrl.hostname);
+    cleanedHeaders.set("Connection", "Upgrade");
+    cleanedHeaders.set("Upgrade", "websocket");
+    cleanedHeaders.set("Sec-WebSocket-Version", "13");
+    cleanedHeaders.set("Sec-WebSocket-Key", key);
   
     // Assemble the HTTP request data for the WebSocket handshake
     const handshakeReq =
       `GET ${targetUrl.pathname}${targetUrl.search} HTTP/1.1\r\n` +
       Array.from(cleanedHeaders.entries())
         .map(([k, v]) => `${k}: ${v}`)
-        .join('\r\n') +
-      '\r\n\r\n';
+        .join("\r\n") +
+      "\r\n\r\n";
 
     log("Sending WebSocket handshake request", handshakeReq);
     const writer = socket.writable.getWriter();
@@ -442,22 +446,283 @@ function relayWebSocketFrames(ws, socket, writer, reader) {
   ws.addEventListener("close", () => socket.close());
 }
 
-// Entry point for handling requests: update configuration, parse target URL, and forward the request
+// 解析 Cookie 字符串，返回一个键值对象
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  if (!cookieHeader) return cookies;
+  cookieHeader.split(";").forEach(cookie => {
+    const [name, ...rest] = cookie.split("=");
+    cookies[name.trim()] = rest.join("=").trim();
+  });
+  return cookies;
+}
+
+// 从请求中去掉用于验证的 Cookie（auth_pwd），返回一个新的 Request 对象
+function removeAuthCookie(req) {
+  const newHeaders = new Headers(req.headers);
+  const cookieHeader = newHeaders.get("Cookie");
+  if (cookieHeader) {
+    const cookies = parseCookies(cookieHeader);
+    delete cookies["auth_pwd"];
+    const newCookie = Object.entries(cookies)
+      .map(([k, v]) => `${k}=${v}`)
+      .join("; ");
+    if (newCookie) {
+      newHeaders.set("Cookie", newCookie);
+    } else {
+      newHeaders.delete("Cookie");
+    }
+  }
+  return new Request(req.url, {
+    method: req.method,
+    headers: newHeaders,
+    body: req.body,
+  });
+}
+
+// 返回密码验证表单页面 HTML，可传入 error 显示错误信息
+function getPasswordFormHTML(error = "") {
+  return `
+  <!DOCTYPE html>
+  <html lang="zh-CN">
+  <head>
+  <style>
+  body {
+    background-color: #fbfbfb;
+    font-family: Arial, sans-serif;
+  }
+  
+  h1 {
+    text-align: center;
+    color: #444;
+  }
+  
+  .container {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+  }
+  
+  form {
+    background-color: white;
+    box-shadow: 0 3px 6px rgba(0, 0, 0, 0.16), 0 3px 6px rgba(0, 0, 0, 0.23);
+    padding: 2rem;
+    border-radius: 8px;
+  }
+  
+  input {
+    display: block;
+    width: 100%;
+    font-size: 18px;
+    padding: 15px;
+    border: solid 1px #ccc;
+    border-radius: 4px;
+    margin: 1rem 0;
+  }
+  
+  button {
+    padding: 15px;
+    background-color: #0288d1;
+    color: white;
+    font-size: 18px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    width: 100%;
+   }
+  
+  button:hover {
+    background-color: #039BE5;
+  }
+  </style>
+    <meta charset="UTF-8">
+    <title>密码验证</title>
+  </head>
+  <body>
+  <h1>请输入密码进行验证</h1>
+  ${error ? `<p style="color:red;">${error}</p>` : ""}
+  <form method="POST">
+    <label>密码: <input type="password" name="password"/></label>
+    <button type="submit">提交</button>
+  </form>
+  </body>
+  </html>
+  `;
+}
+
+// 返回中转跳转页面 HTML，本页面内包含目标网址输入框和“浏览”按钮，提交后将跳转至 /AUTH_TOKEN/<目标网址>
+function getRedirectPageHTML() {
+  return `
+  <html lang="zh-CN">
+  <head>
+  <style>
+  body {
+    background-color: #fbfbfb;
+    font-family: Arial, sans-serif;
+  }
+  
+  h1 {
+    text-align: center;
+    color: #444;
+  }
+  
+  .container {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+  }
+  
+  form {
+    background-color: white;
+    box-shadow: 0 3px 6px rgba(0, 0, 0, 0.16), 0 3px 6px rgba(0, 0, 0, 0.23);
+    padding: 2rem;
+    border-radius: 8px;
+  }
+  
+  input {
+    display: block;
+    width: 100%;
+    font-size: 18px;
+    padding: 15px;
+    border: solid 1px #ccc;
+    border-radius: 4px;
+    margin: 1rem 0;
+  }
+  
+  button {
+    padding: 15px;
+    background-color: #0288d1;
+    color: white;
+    font-size: 18px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    width: 100%;
+  }
+  
+  button:hover {
+    background-color: #039BE5;
+  }
+  </style>
+    <meta charset="UTF-8">
+    <title>安全访问</title>
+  </head>
+  <body>
+    <h1>请输入安全访问路径</h1>
+    <form id="proxy-form">
+      <input type="text" id="url" name="url" placeholder="请输入路径" required />
+      <button type="submit">安全访问</button>
+    </form>
+    <script>
+      const form = document.getElementById('proxy-form');
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        const input = document.getElementById('url');
+        const actualUrl = input.value;
+        const proxyUrl = './' + actualUrl;
+        //location.href = proxyUrl;
+        window.open(proxyUrl, '_blank');
+      });
+    </script>
+  </body>
+  </html>
+  `;
+}
+
+// Entry point for handling requests: update configuration,判断路径及Cookie后进行相应的密码验证、跳转中转 或 转发请求
 async function handleRequest(req, env) {
   updateConfigFromEnv(env);
-  CONFIG.DEBUG_MODE = CONFIG.DEBUG_MODE;
+  CONFIG.DEBUG_MODE = CONFIG.DEBUG_MODE; // 保持debug模式
+
   const url = new URL(req.url);
   const parts = url.pathname.split("/").filter(Boolean);
-  const [auth, protocol, ...path] = parts;
-  // Check whether the auth parameter matches the configured auth token
+
+  // 如果请求路径的第一个分段是 SafePath，则直接转发（不需要密码验证）
+  if (parts[0] === CONFIG.SafePath) {
+    let dstUrl;
+    if (parts.length >= 2) {
+      const [, protocol, ...rest] = parts;
+      dstUrl = protocol ? `${protocol}//${rest.join("/")}${url.search}` : CONFIG.DEFAULT_DST_URL;
+    } else {
+      dstUrl = CONFIG.DEFAULT_DST_URL;
+    }
+    log("SafePath forwarding", dstUrl);
+    return await nativeFetch(req, dstUrl);
+  }
+
+  // 如果请求路径的第一个分段是 AUTH_TOKEN，则需要验证密码
+  if (parts[0] === CONFIG.AUTH_TOKEN) {
+    const cookieHeader = req.headers.get("Cookie");
+    const cookies = parseCookies(cookieHeader);
+    const validCookie = cookies["auth_pwd"] === CONFIG.PASSWORD;
+
+    // 如果请求方法为 POST，则可能是提交密码或提交目标网址
+    if (req.method === "POST") {
+      const contentType = req.headers.get("Content-Type") || "";
+      if (contentType.includes("application/x-www-form-urlencoded")) {
+        const formData = await req.formData();
+        // 如果提交了密码字段，则进行密码验证
+        if (formData.has("password")) {
+          const submittedPassword = formData.get("password").trim();
+          if (submittedPassword === CONFIG.PASSWORD) {
+            // 密码正确，设置 auth_pwd Cookie，并显示中转跳转页
+            return new Response(getRedirectPageHTML(), {
+              status: 200,
+              headers: {
+                "Content-Type": "text/html",
+                "Set-Cookie": `auth_pwd=${CONFIG.PASSWORD}; Path=/; HttpOnly`,
+              },
+            });
+          } else {
+            // 密码错误，重新显示密码验证表单
+            return new Response(getPasswordFormHTML("密码错误，请重试。"), {
+              status: 200,
+              headers: { "Content-Type": "text/html" },
+            });
+          }
+        } else if (formData.has("destUrl")) {
+          // 如果提交了目标网址字段，则跳转到 /AUTH_TOKEN/<destUrl>
+          const destUrl = formData.get("destUrl").trim();
+          return Response.redirect(`/${CONFIG.AUTH_TOKEN}/${destUrl}`, 302);
+        }
+      }
+    }
+
+    // 如果 Cookie 中没有正确的密码，则显示密码验证表单
+    if (!validCookie) {
+      return new Response(getPasswordFormHTML(), {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    // 当 Cookie 验证正确时：
+    // 如果只有 /AUTH_TOKEN（即没有目标网址），则显示跳转中转页供用户输入目标网址
+    if (parts.length === 1) {
+      return new Response(getRedirectPageHTML(), {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      });
+    } else {
+      // 如果请求路径包含目标地址，则在转发前去掉 auth_pwd Cookie
+      const newReq = removeAuthCookie(req);
+      // 原先的逻辑： parts 格式为 [AUTH_TOKEN, protocol, ...rest]
+      const [, protocol, ...rest] = parts;
+      const dstUrl = protocol ? `${protocol}//${rest.join("/")}${url.search}` : CONFIG.DEFAULT_DST_URL;
+      log("Forwarding request from /AUTH_TOKEN", dstUrl);
+      return await nativeFetch(newReq, dstUrl);
+    }
+  }
+
+  // 如果请求路径既不属于 SafePath，也不属于 AUTH_TOKEN，则使用原有逻辑（例如转发到默认目标）
+  const [auth, protocol, ...rest] = parts;
   const isValid = auth === CONFIG.AUTH_TOKEN;
-  // If it matches, construct the target URL; otherwise, use the default target
-  const dstUrl =
-    isValid && protocol
-      ? `${protocol}//${path.join("/")}${url.search}`
-      : CONFIG.DEFAULT_DST_URL;
-  log("Target URL", dstUrl);
-  
+  const dstUrl = isValid && protocol ? `${protocol}//${rest.join("/")}${url.search}` : CONFIG.DEFAULT_DST_URL;
+  log("Fallback forwarding", dstUrl);
   return await nativeFetch(req, dstUrl);
 }
 
