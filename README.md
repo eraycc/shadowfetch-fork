@@ -2,6 +2,10 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
+# 新特性
+- 在auth路径上新增cookie验证密码，新增auth路径上密码和跳转界面，适合于日常使用，避免直接审查代理路径URL
+- 新增safepath，当访问/safepath/url时可以直接代理，无需密码验证，适用于固定的API代理
+
 > A privacy-focused alternative to Cloudflare Workers' built-in fetch, licensed under the GNU Affero General Public License (AGPL).
 
 ## 📑 Table of Contents
